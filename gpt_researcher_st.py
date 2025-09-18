@@ -1,8 +1,10 @@
+
 from __future__ import annotations
-import os, io, asyncio, logging, textwrap
+import os, io, asyncio, logging, textwrap, inspect
 from typing import List, Dict, Any, Tuple, Optional
 from contextlib import asynccontextmanager
 import streamlit as st
+from copy import deepcopy
 
 from gpt_researcher import GPTResearcher
 
@@ -64,13 +66,73 @@ ATLAS_VECTOR_INDEX  = "vector_index_demo"  # unchanged
 ATLAS_VECTOR_INDEX_REGGINIE   = "openai_vector_index"  # unchanged
 
 MCP_ENV_VAR = "MCP_SERVERS"
-_MCP_BASELINE = os.environ.get(MCP_ENV_VAR, "")
+
+# Static MCP registry. These definitions are serialized and pushed into the
+# environment before each GPT Researcher run so we do not depend on external
+# configuration files. Update API keys / connection strings via the standard
+# environment variables referenced below.
+MCP_STATIC_REGISTRY: Dict[str, Dict[str, Any]] = {
+    "vector_store_rag": {
+        "label": "🗂 (MongoDB) My Documents (RAG)",
+        "kind": "vector_store",
+        "options": {
+            "database": DB_NAME_RAG,
+            "connection_env": "ATLAS_CONNECTION_STR",
+        },
+    },
+    "vector_store_reg": {
+        "label": "🗂 (MongoDB) RegGinie collections",
+        "kind": "vector_store",
+        "options": {
+            "database": DB_NAME_REGGINIE,
+            "connection_env": "ATLAS_CONNECTION_STR_REG",
+        },
+    },
+    "tavily": {
+        "label": "🔎 Tavily",
+        "kind": "web",
+        "server": {
+            "command": "python",
+            "args": ["-m", "gpt_researcher.mcp_servers.tavily"],
+            "env": {
+                "TAVILY_API_KEY": os.getenv("TAVILY_API_KEY", ""),
+            },
+        },
+    },
+    "arxiv": {
+        "label": "📄 arXiv",
+        "kind": "web",
+        "server": {
+            "command": "python",
+            "args": ["-m", "gpt_researcher.mcp_servers.arxiv"],
+            "env": {},
+        },
+    },
+    "pubmed_central": {
+        "label": "🧪 PubMed Central",
+        "kind": "web",
+        "server": {
+            "command": "python",
+            "args": ["-m", "gpt_researcher.mcp_servers.pubmed_central"],
+            "env": {
+                "NCBI_API_KEY": os.getenv("NCBI_API_KEY", ""),
+            },
+        },
+    },
+}
 
 # Normalized identifiers for MCP entries that should be treated as Mongo vector stores.
 _VECTOR_MCP_KEYS = {"vector_store_rag", "mongo_rag", "vector_store_reg", "mongo_reg"}
 
 # Normalized identifiers for MCP entries that should receive date-filter hooks.
 _WEB_FILTER_AWARE_MCPS = {"tavily", "pubmed", "pubmed_central", "arxiv"}
+
+
+try:
+    _GPT_INIT_PARAMS = inspect.signature(GPTResearcher.__init__).parameters
+    _GPT_SUPPORTS_MCP_CONFIGS = "mcp_configs" in _GPT_INIT_PARAMS
+except Exception:
+    _GPT_SUPPORTS_MCP_CONFIGS = False
 
 
 def _normalize_mcp_key(name: str) -> str:
@@ -84,17 +146,8 @@ def _normalize_mcp_key(name: str) -> str:
 
 
 def _load_mcp_registry() -> Dict[str, Any]:
-    """Parse the MCP registry from the environment."""
-    raw = _MCP_BASELINE or os.environ.get(MCP_ENV_VAR, "")
-    if not raw:
-        return {}
-    try:
-        registry = json.loads(raw)
-        if isinstance(registry, dict):
-            return registry
-    except Exception as exc:
-        logging.warning("Failed to parse %s: %s", MCP_ENV_VAR, exc)
-    return {}
+    """Return a copy of the static MCP registry."""
+    return deepcopy(MCP_STATIC_REGISTRY)
 
 
 def _format_mcp_label(key: str, meta: Dict[str, Any]) -> str:
@@ -120,7 +173,7 @@ def _slug_filename_part(text: str, maxlen: int = 80) -> str:
     # Lowercase and replace non-alnum with single hyphens
     text = re.sub(r"[^a-zA-Z0-9]+", "-", text.lower()).strip("-")
     # Collapse consecutive hyphens and trim
-    text = re.sub(r"-{2,}", "-")
+    # text = re.sub(r"-{2,}", "-")
     return text[:maxlen].strip("-")
 
 def _build_report_filename(question: str, report_type: str, custom_prompt: str, ext: str) -> str:
@@ -200,10 +253,11 @@ async def _async_run(query: str, cfg: Dict[str, Any]):
     mcp_servers_json = cfg.pop("mcp_servers_json", None)
     retriever_mode   = cfg.pop("retriever_mode", None)
     mcp_selection_env = cfg.pop("mcp_selection_env", None)
+    mcp_configs = cfg.pop("mcp_configs", None)
 
     env_prev: Dict[str, Optional[str]] = {}
-    vector_store = None
-    report_source = "web"
+    result: Tuple[str, Any, Any, Any, Any] = ("", None, None, None, None)
+
     try:
         if retriever_mode is not None:
             env_prev["RETRIEVER"] = os.environ.get("RETRIEVER")
@@ -222,6 +276,9 @@ async def _async_run(query: str, cfg: Dict[str, Any]):
         web_mcps_norm = [norm for _, norm in normalized_pairs if norm not in _VECTOR_MCP_KEYS]
         has_vector = has_rag or has_reg
         exactly_one_vector = int(has_rag) + int(has_reg) == 1
+
+        vector_store = None
+        report_source = "web"
 
         # Choose vector store (only if exactly one vector backend is selected)
         if exactly_one_vector:
@@ -249,108 +306,119 @@ async def _async_run(query: str, cfg: Dict[str, Any]):
             install_date_filter_hooks(date_filters)
 
         st.sidebar.write(report_source, selected_mcps)
+
+        post_init_mcp_configs = None
+
+        base_kwargs = dict(
+            query=query,
+            report_type=cfg["report_type"],
+            tone=cfg["tone"],
+            verbose=cfg["verbose"],
+            report_source=report_source,
+            vector_store=vector_store,
+        )
+
+        if mcp_configs:
+            if _GPT_SUPPORTS_MCP_CONFIGS:
+                base_kwargs["mcp_configs"] = mcp_configs
+            else:
+                post_init_mcp_configs = mcp_configs
+
+        if report_source != 'langchain_vectorstore':
+            base_kwargs.update(
+                report_format=cfg["report_format"],
+                source_urls=urls or None,
+                complement_source_urls=cfg["complement"],
+            )
+
+        researcher = GPTResearcher(**base_kwargs)
+
+        if post_init_mcp_configs:
+            setattr(researcher, "mcp_configs", post_init_mcp_configs)
+
+        # optional extras…
+        USER_EXTRAS = [
+            "breadth", "depth", "max_subtopics",
+            "draft_section_titles", "subtopic_name", "custom_prompt", "on_progress"
+        ]
+        for key in USER_EXTRAS:
+            if key in cfg:
+                setattr(researcher, key, cfg[key])
+
+        ui = cfg.pop("ui", {}) if isinstance(cfg.get("ui"), dict) else {}
+        trace_box = ui.get("trace_box", st.empty())
+        answer_container = ui.get("answer_box", st.empty())
+
+        # logging + streaming unchanged…
+        fmt = logging.Formatter("INFO:     [%(asctime)s] %(message)s", datefmt="%H:%M:%S")
+        handler = TraceBufferHandler(max_lines=2000)
+        handler.setFormatter(fmt)
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+        logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+        _hook_research_logs(handler)
+        pumper = asyncio.create_task(_pump_trace_ui(trace_box, handler))
+        st.write(researcher)
+        try:
+            def _emit_info(line: str):
+                if not line: return
+                rec = logging.LogRecord(
+                    name="gpt_researcher.stdout", level=logging.INFO,
+                    pathname=__file__, lineno=0, msg=line.rstrip(), args=(), exc_info=None
+                )
+                handler.handle(rec)
+
+            with stdout(_emit_info, terminator=""):
+                with stderr(_emit_info, terminator=""):
+                    await researcher.conduct_research()
+        finally:
+            handler.stop()
+            await pumper
+            _unhook_research_logs(handler)
+
+        md = ""
+        try:
+            stream_fn = getattr(researcher, "stream_report", None)
+            if callable(stream_fn):
+                chunks: list[str] = []
+                async def _gen():
+                    async for delta in stream_fn():
+                        s = delta if isinstance(delta, str) else str(delta)
+                        chunks.append(s)
+                        yield s
+                await _progressive_markdown_stream(answer_container, _gen())
+                final_fn = getattr(researcher, "get_final_report", None)
+                md = final_fn() if callable(final_fn) else "".join(chunks)
+                if not isinstance(md, str) or not md:
+                    md = "".join(chunks)
+            else:
+                md = await researcher.write_report()
+                await _fake_stream_from_final(md, answer_container)
+        except Exception as e:
+            logging.exception("write/stream report failed: %s", e)
+            try:
+                md = await researcher.write_report()
+                answer_container.markdown(md)
+            except Exception as e2:
+                st.error(f"Failed to generate report: {e2}")
+                md = ""
+
+        result = (
+            md if md is not None else "",
+            researcher.get_costs(),
+            researcher.get_research_images(),
+            researcher.get_source_urls(),
+            researcher.get_research_sources()
+        )
+
     finally:
         for key, previous in env_prev.items():
             if previous is None:
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = previous
-    if report_source == 'langchain_vectorstore':
-        researcher = GPTResearcher(
-            query         = query,
-            report_type   = cfg["report_type"],
-            tone          = cfg["tone"],
-            verbose       = cfg["verbose"],
-            report_source = report_source,     # "langchain_vectorstore" | "hybrid" | "web"
-            vector_store  = vector_store,      # Mongo instance, or None
-        )
-    else:
-        researcher = GPTResearcher(
-            query         = query,
-            report_type   = cfg["report_type"],
-            tone          = cfg["tone"],
-            report_format = cfg["report_format"],
-            verbose       = cfg["verbose"],
-            report_source = report_source,     # "langchain_vectorstore" | "hybrid" | "web"
-            vector_store  = vector_store,      # Mongo instance, or None
-            source_urls   = urls or None,
-            complement_source_urls = cfg["complement"],
-        )
-        
-    # optional extras…
-    USER_EXTRAS = [
-        "breadth", "depth", "max_subtopics",
-        "draft_section_titles", "subtopic_name", "custom_prompt", "on_progress"
-    ]
-    for key in USER_EXTRAS:
-        if key in cfg:
-            setattr(researcher, key, cfg[key])
 
-    ui = cfg.pop("ui", {}) if isinstance(cfg.get("ui"), dict) else {}
-    trace_box = ui.get("trace_box", st.empty())
-    answer_container = ui.get("answer_box", st.empty())
-
-    # logging + streaming unchanged…
-    fmt = logging.Formatter("INFO:     [%(asctime)s] %(message)s", datefmt="%H:%M:%S")
-    handler = TraceBufferHandler(max_lines=2000)
-    handler.setFormatter(fmt)
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("httpcore").setLevel(logging.WARNING)
-
-    _hook_research_logs(handler)
-    pumper = asyncio.create_task(_pump_trace_ui(trace_box, handler))
-    st.write(researcher)
-    try:
-        def _emit_info(line: str):
-            if not line: return
-            rec = logging.LogRecord(
-                name="gpt_researcher.stdout", level=logging.INFO,
-                pathname=__file__, lineno=0, msg=line.rstrip(), args=(), exc_info=None
-            )
-            handler.handle(rec)
-
-        with stdout(_emit_info, terminator=""):
-            with stderr(_emit_info, terminator=""):
-                await researcher.conduct_research()
-    finally:
-        handler.stop()
-        await pumper
-        _unhook_research_logs(handler)
-
-    md = ""
-    try:
-        stream_fn = getattr(researcher, "stream_report", None)
-        if callable(stream_fn):
-            chunks: list[str] = []
-            async def _gen():
-                async for delta in stream_fn():
-                    s = delta if isinstance(delta, str) else str(delta)
-                    chunks.append(s)
-                    yield s
-            await _progressive_markdown_stream(answer_container, _gen())
-            final_fn = getattr(researcher, "get_final_report", None)
-            md = final_fn() if callable(final_fn) else "".join(chunks)
-            if not isinstance(md, str) or not md:
-                md = "".join(chunks)
-        else:
-            md = await researcher.write_report()
-            await _fake_stream_from_final(md, answer_container)
-    except Exception as e:
-        logging.exception("write/stream report failed: %s", e)
-        try:
-            md = await researcher.write_report()
-            answer_container.markdown(md)
-        except Exception as e2:
-            st.error(f"Failed to generate report: {e2}")
-            md = ""
-
-    return (
-        md if md is not None else "",
-        researcher.get_costs(),
-        researcher.get_research_images(),
-        researcher.get_source_urls(),
-        researcher.get_research_sources()
-    )
+    return result
 
 def _coerce_to_text(resp: Any) -> str:
     if resp is None: return ""
@@ -719,7 +787,7 @@ def app():
             default=default_mcps,
             format_func=lambda key: _format_mcp_label(key, mcp_registry.get(key, {})),
             disabled=not bool(mcp_options),
-            help="Select one or more MCP servers configured via the MCP_SERVERS environment variable.",
+            help="Select one or more connectors defined in MCP_STATIC_REGISTRY.",
         )
         st.session_state["_mcp_selected_defaults"] = mcps_selected
 
@@ -742,7 +810,7 @@ def app():
             collection = st.selectbox("Collection", [], disabled=True)
 
         if not mcp_options:
-            st.info("Configure MCP connectors via the MCP_SERVERS environment variable (JSON mapping) and set RETRIEVER=mcp in your .env.")
+            st.info("No MCP connectors configured in MCP_STATIC_REGISTRY. Update the registry in `gpt_researcher_st.py` to enable selections.")
 
 
         report_type = st.selectbox(
@@ -757,7 +825,7 @@ def app():
             extras["breadth"] = st.slider("Breadth (branches per level)", 1, 10, 4)
             extras["depth"]   = st.slider("Depth (levels)",               1,  5, 2)
         if report_type == "detailed_report":
-            extras["max_subtopics"] = st.slider("Max sub-topics", 3, 10, 5)
+            extras["max_subtopics"] = st.slider("Max sub-topics", 3, 10, 7)
         if report_type == "outline_report":
             extras["draft_section_titles"] = st.text_area(
                 "Draft section titles (one per line)",
@@ -890,7 +958,25 @@ def app():
             if not mcps_selected:
                 st.warning("Select at least one MCP source from the sidebar before running."); st.stop()
 
-            selected_mcp_config = {name: mcp_registry.get(name) for name in mcps_selected if name in mcp_registry}
+            selected_mcp_config: Dict[str, Any] = {}
+            selected_mcp_list: List[Dict[str, Any]] = []
+            for name in mcps_selected:
+                if name not in mcp_registry:
+                    continue
+                entry = deepcopy(mcp_registry[name])
+                norm = _normalize_mcp_key(name)
+                if collection:
+                    if norm in {"vector_store_rag", "mongo_rag"}:
+                        entry.setdefault("options", {})["collection"] = collection
+                    elif norm in {"vector_store_reg", "mongo_reg"}:
+                        entry.setdefault("options", {})["collection"] = collection
+
+                entry_for_json = deepcopy(entry)
+                entry_for_list = deepcopy(entry)
+                entry_for_list.setdefault("name", name)
+
+                selected_mcp_config[name] = entry_for_json
+                selected_mcp_list.append(entry_for_list)
             try:
                 mcp_servers_json = json.dumps(selected_mcp_config)
             except TypeError as exc:
@@ -901,6 +987,7 @@ def app():
                 mcp_servers_json=mcp_servers_json,
                 mcp_selection_env=",".join(mcps_selected),
                 retriever_mode="mcp",
+                mcp_configs=selected_mcp_list,
                 collection=collection,
                 report_type=report_type,
                 tone=tone,
