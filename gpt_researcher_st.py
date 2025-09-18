@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os, io, asyncio, logging, textwrap
+import os, io, asyncio, logging, textwrap, inspect
 from typing import List, Dict, Any, Tuple, Optional
 from contextlib import asynccontextmanager
 import streamlit as st
@@ -127,6 +127,13 @@ _VECTOR_MCP_KEYS = {"vector_store_rag", "mongo_rag", "vector_store_reg", "mongo_
 _WEB_FILTER_AWARE_MCPS = {"tavily", "pubmed", "pubmed_central", "arxiv"}
 
 
+try:
+    _GPT_INIT_PARAMS = inspect.signature(GPTResearcher.__init__).parameters
+    _GPT_SUPPORTS_MCP_CONFIGS = "mcp_configs" in _GPT_INIT_PARAMS
+except Exception:
+    _GPT_SUPPORTS_MCP_CONFIGS = False
+
+
 def _normalize_mcp_key(name: str) -> str:
     """Normalize MCP keys for consistent comparisons."""
     if not name:
@@ -245,6 +252,7 @@ async def _async_run(query: str, cfg: Dict[str, Any]):
     mcp_servers_json = cfg.pop("mcp_servers_json", None)
     retriever_mode   = cfg.pop("retriever_mode", None)
     mcp_selection_env = cfg.pop("mcp_selection_env", None)
+    mcp_configs = cfg.pop("mcp_configs", None)
 
     env_prev: Dict[str, Optional[str]] = {}
     result: Tuple[str, Any, Any, Any, Any] = ("", None, None, None, None)
@@ -298,27 +306,34 @@ async def _async_run(query: str, cfg: Dict[str, Any]):
 
         st.sidebar.write(report_source, selected_mcps)
 
-        if report_source == 'langchain_vectorstore':
-            researcher = GPTResearcher(
-                query         = query,
-                report_type   = cfg["report_type"],
-                tone          = cfg["tone"],
-                verbose       = cfg["verbose"],
-                report_source = report_source,     # "langchain_vectorstore" | "hybrid" | "web"
-                vector_store  = vector_store,      # Mongo instance, or None
+        post_init_mcp_configs = None
+
+        base_kwargs = dict(
+            query=query,
+            report_type=cfg["report_type"],
+            tone=cfg["tone"],
+            verbose=cfg["verbose"],
+            report_source=report_source,
+            vector_store=vector_store,
+        )
+
+        if mcp_configs:
+            if _GPT_SUPPORTS_MCP_CONFIGS:
+                base_kwargs["mcp_configs"] = mcp_configs
+            else:
+                post_init_mcp_configs = mcp_configs
+
+        if report_source != 'langchain_vectorstore':
+            base_kwargs.update(
+                report_format=cfg["report_format"],
+                source_urls=urls or None,
+                complement_source_urls=cfg["complement"],
             )
-        else:
-            researcher = GPTResearcher(
-                query         = query,
-                report_type   = cfg["report_type"],
-                tone          = cfg["tone"],
-                report_format = cfg["report_format"],
-                verbose       = cfg["verbose"],
-                report_source = report_source,     # "langchain_vectorstore" | "hybrid" | "web"
-                vector_store  = vector_store,      # Mongo instance, or None
-                source_urls   = urls or None,
-                complement_source_urls = cfg["complement"],
-            )
+
+        researcher = GPTResearcher(**base_kwargs)
+
+        if post_init_mcp_configs:
+            setattr(researcher, "mcp_configs", post_init_mcp_configs)
 
         # optional extras…
         USER_EXTRAS = [
@@ -943,6 +958,7 @@ def app():
                 st.warning("Select at least one MCP source from the sidebar before running."); st.stop()
 
             selected_mcp_config: Dict[str, Any] = {}
+            selected_mcp_list: List[Dict[str, Any]] = []
             for name in mcps_selected:
                 if name not in mcp_registry:
                     continue
@@ -953,7 +969,13 @@ def app():
                         entry.setdefault("options", {})["collection"] = collection
                     elif norm in {"vector_store_reg", "mongo_reg"}:
                         entry.setdefault("options", {})["collection"] = collection
-                selected_mcp_config[name] = entry
+
+                entry_for_json = deepcopy(entry)
+                entry_for_list = deepcopy(entry)
+                entry_for_list.setdefault("name", name)
+
+                selected_mcp_config[name] = entry_for_json
+                selected_mcp_list.append(entry_for_list)
             try:
                 mcp_servers_json = json.dumps(selected_mcp_config)
             except TypeError as exc:
@@ -964,6 +986,7 @@ def app():
                 mcp_servers_json=mcp_servers_json,
                 mcp_selection_env=",".join(mcps_selected),
                 retriever_mode="mcp",
+                mcp_configs=selected_mcp_list,
                 collection=collection,
                 report_type=report_type,
                 tone=tone,
