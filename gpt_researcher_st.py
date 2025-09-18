@@ -247,8 +247,8 @@ async def _async_run(query: str, cfg: Dict[str, Any]):
     mcp_selection_env = cfg.pop("mcp_selection_env", None)
 
     env_prev: Dict[str, Optional[str]] = {}
-    vector_store = None
-    report_source = "web"
+    result: Tuple[str, Any, Any, Any, Any] = ("", None, None, None, None)
+
     try:
         if retriever_mode is not None:
             env_prev["RETRIEVER"] = os.environ.get("RETRIEVER")
@@ -267,6 +267,9 @@ async def _async_run(query: str, cfg: Dict[str, Any]):
         web_mcps_norm = [norm for _, norm in normalized_pairs if norm not in _VECTOR_MCP_KEYS]
         has_vector = has_rag or has_reg
         exactly_one_vector = int(has_rag) + int(has_reg) == 1
+
+        vector_store = None
+        report_source = "web"
 
         # Choose vector store (only if exactly one vector backend is selected)
         if exactly_one_vector:
@@ -294,108 +297,112 @@ async def _async_run(query: str, cfg: Dict[str, Any]):
             install_date_filter_hooks(date_filters)
 
         st.sidebar.write(report_source, selected_mcps)
+
+        if report_source == 'langchain_vectorstore':
+            researcher = GPTResearcher(
+                query         = query,
+                report_type   = cfg["report_type"],
+                tone          = cfg["tone"],
+                verbose       = cfg["verbose"],
+                report_source = report_source,     # "langchain_vectorstore" | "hybrid" | "web"
+                vector_store  = vector_store,      # Mongo instance, or None
+            )
+        else:
+            researcher = GPTResearcher(
+                query         = query,
+                report_type   = cfg["report_type"],
+                tone          = cfg["tone"],
+                report_format = cfg["report_format"],
+                verbose       = cfg["verbose"],
+                report_source = report_source,     # "langchain_vectorstore" | "hybrid" | "web"
+                vector_store  = vector_store,      # Mongo instance, or None
+                source_urls   = urls or None,
+                complement_source_urls = cfg["complement"],
+            )
+
+        # optional extras…
+        USER_EXTRAS = [
+            "breadth", "depth", "max_subtopics",
+            "draft_section_titles", "subtopic_name", "custom_prompt", "on_progress"
+        ]
+        for key in USER_EXTRAS:
+            if key in cfg:
+                setattr(researcher, key, cfg[key])
+
+        ui = cfg.pop("ui", {}) if isinstance(cfg.get("ui"), dict) else {}
+        trace_box = ui.get("trace_box", st.empty())
+        answer_container = ui.get("answer_box", st.empty())
+
+        # logging + streaming unchanged…
+        fmt = logging.Formatter("INFO:     [%(asctime)s] %(message)s", datefmt="%H:%M:%S")
+        handler = TraceBufferHandler(max_lines=2000)
+        handler.setFormatter(fmt)
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+        logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+        _hook_research_logs(handler)
+        pumper = asyncio.create_task(_pump_trace_ui(trace_box, handler))
+        st.write(researcher)
+        try:
+            def _emit_info(line: str):
+                if not line: return
+                rec = logging.LogRecord(
+                    name="gpt_researcher.stdout", level=logging.INFO,
+                    pathname=__file__, lineno=0, msg=line.rstrip(), args=(), exc_info=None
+                )
+                handler.handle(rec)
+
+            with stdout(_emit_info, terminator=""):
+                with stderr(_emit_info, terminator=""):
+                    await researcher.conduct_research()
+        finally:
+            handler.stop()
+            await pumper
+            _unhook_research_logs(handler)
+
+        md = ""
+        try:
+            stream_fn = getattr(researcher, "stream_report", None)
+            if callable(stream_fn):
+                chunks: list[str] = []
+                async def _gen():
+                    async for delta in stream_fn():
+                        s = delta if isinstance(delta, str) else str(delta)
+                        chunks.append(s)
+                        yield s
+                await _progressive_markdown_stream(answer_container, _gen())
+                final_fn = getattr(researcher, "get_final_report", None)
+                md = final_fn() if callable(final_fn) else "".join(chunks)
+                if not isinstance(md, str) or not md:
+                    md = "".join(chunks)
+            else:
+                md = await researcher.write_report()
+                await _fake_stream_from_final(md, answer_container)
+        except Exception as e:
+            logging.exception("write/stream report failed: %s", e)
+            try:
+                md = await researcher.write_report()
+                answer_container.markdown(md)
+            except Exception as e2:
+                st.error(f"Failed to generate report: {e2}")
+                md = ""
+
+        result = (
+            md if md is not None else "",
+            researcher.get_costs(),
+            researcher.get_research_images(),
+            researcher.get_source_urls(),
+            researcher.get_research_sources()
+        )
+
     finally:
         for key, previous in env_prev.items():
             if previous is None:
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = previous
-    if report_source == 'langchain_vectorstore':
-        researcher = GPTResearcher(
-            query         = query,
-            report_type   = cfg["report_type"],
-            tone          = cfg["tone"],
-            verbose       = cfg["verbose"],
-            report_source = report_source,     # "langchain_vectorstore" | "hybrid" | "web"
-            vector_store  = vector_store,      # Mongo instance, or None
-        )
-    else:
-        researcher = GPTResearcher(
-            query         = query,
-            report_type   = cfg["report_type"],
-            tone          = cfg["tone"],
-            report_format = cfg["report_format"],
-            verbose       = cfg["verbose"],
-            report_source = report_source,     # "langchain_vectorstore" | "hybrid" | "web"
-            vector_store  = vector_store,      # Mongo instance, or None
-            source_urls   = urls or None,
-            complement_source_urls = cfg["complement"],
-        )
-        
-    # optional extras…
-    USER_EXTRAS = [
-        "breadth", "depth", "max_subtopics",
-        "draft_section_titles", "subtopic_name", "custom_prompt", "on_progress"
-    ]
-    for key in USER_EXTRAS:
-        if key in cfg:
-            setattr(researcher, key, cfg[key])
 
-    ui = cfg.pop("ui", {}) if isinstance(cfg.get("ui"), dict) else {}
-    trace_box = ui.get("trace_box", st.empty())
-    answer_container = ui.get("answer_box", st.empty())
-
-    # logging + streaming unchanged…
-    fmt = logging.Formatter("INFO:     [%(asctime)s] %(message)s", datefmt="%H:%M:%S")
-    handler = TraceBufferHandler(max_lines=2000)
-    handler.setFormatter(fmt)
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("httpcore").setLevel(logging.WARNING)
-
-    _hook_research_logs(handler)
-    pumper = asyncio.create_task(_pump_trace_ui(trace_box, handler))
-    st.write(researcher)
-    try:
-        def _emit_info(line: str):
-            if not line: return
-            rec = logging.LogRecord(
-                name="gpt_researcher.stdout", level=logging.INFO,
-                pathname=__file__, lineno=0, msg=line.rstrip(), args=(), exc_info=None
-            )
-            handler.handle(rec)
-
-        with stdout(_emit_info, terminator=""):
-            with stderr(_emit_info, terminator=""):
-                await researcher.conduct_research()
-    finally:
-        handler.stop()
-        await pumper
-        _unhook_research_logs(handler)
-
-    md = ""
-    try:
-        stream_fn = getattr(researcher, "stream_report", None)
-        if callable(stream_fn):
-            chunks: list[str] = []
-            async def _gen():
-                async for delta in stream_fn():
-                    s = delta if isinstance(delta, str) else str(delta)
-                    chunks.append(s)
-                    yield s
-            await _progressive_markdown_stream(answer_container, _gen())
-            final_fn = getattr(researcher, "get_final_report", None)
-            md = final_fn() if callable(final_fn) else "".join(chunks)
-            if not isinstance(md, str) or not md:
-                md = "".join(chunks)
-        else:
-            md = await researcher.write_report()
-            await _fake_stream_from_final(md, answer_container)
-    except Exception as e:
-        logging.exception("write/stream report failed: %s", e)
-        try:
-            md = await researcher.write_report()
-            answer_container.markdown(md)
-        except Exception as e2:
-            st.error(f"Failed to generate report: {e2}")
-            md = ""
-
-    return (
-        md if md is not None else "",
-        researcher.get_costs(),
-        researcher.get_research_images(),
-        researcher.get_source_urls(),
-        researcher.get_research_sources()
-    )
+    return result
 
 def _coerce_to_text(resp: Any) -> str:
     if resp is None: return ""
