@@ -247,166 +247,96 @@ AG.handle_json_error = handle_json_error
 
 # ─────────────────────────── gpt_researcher run ───────────────────────────────
 async def _async_run(query: str, cfg: Dict[str, Any]):
-    # Read config and keep the raw MCP selection (don't mutate yet)
+    # Read config and keep the raw MCP selection (don’t mutate yet)
     selected_mcps = list(cfg.pop("selected_mcps") or [])
     urls          = cfg.pop("urls")
-    
+    mcp_servers_json = cfg.pop("mcp_servers_json", None)
+    retriever_mode   = cfg.pop("retriever_mode", None)
+    mcp_selection_env = cfg.pop("mcp_selection_env", None)
+    mcp_configs = cfg.pop("mcp_configs", None)
+
     env_prev: Dict[str, Optional[str]] = {}
     result: Tuple[str, Any, Any, Any, Any] = ("", None, None, None, None)
 
     try:
-        # Normalize and categorize selections
+        if retriever_mode is not None:
+            env_prev["RETRIEVER"] = os.environ.get("RETRIEVER")
+            os.environ["RETRIEVER"] = retriever_mode
+        if mcp_servers_json is not None:
+            env_prev[MCP_ENV_VAR] = os.environ.get(MCP_ENV_VAR)
+            os.environ[MCP_ENV_VAR] = mcp_servers_json
+        if mcp_selection_env is not None:
+            env_prev["MCP_SELECTED"] = os.environ.get("MCP_SELECTED")
+            os.environ["MCP_SELECTED"] = mcp_selection_env
+
         normalized_pairs = [(mcp, _normalize_mcp_key(mcp)) for mcp in selected_mcps]
-        
-        # Separate vector stores from web retrievers
-        vector_selections = []
-        web_retriever_selections = []
-        
-        for orig, norm in normalized_pairs:
-            if norm in _VECTOR_MCP_KEYS:
-                vector_selections.append((orig, norm))
-            elif norm in _WEB_RETRIEVER_KEYS:
-                web_retriever_selections.append((orig, norm))
-        
-        has_rag = any(norm in {"vector_store_rag", "mongo_rag"} for _, norm in vector_selections)
-        has_reg = any(norm in {"vector_store_reg", "mongo_reg"} for _, norm in vector_selections)
+        has_rag = any(norm in {"vector_store_rag", "mongo_rag"} for _, norm in normalized_pairs)
+        has_reg = any(norm in {"vector_store_reg", "mongo_reg"} for _, norm in normalized_pairs)
+        web_mcps = [orig for orig, norm in normalized_pairs if norm not in _VECTOR_MCP_KEYS]
+        web_mcps_norm = [norm for _, norm in normalized_pairs if norm not in _VECTOR_MCP_KEYS]
         has_vector = has_rag or has_reg
         exactly_one_vector = int(has_rag) + int(has_reg) == 1
-        has_web_retrievers = len(web_retriever_selections) > 0
-        
-        logging.info(f"Selection analysis: has_vector={has_vector}, has_web_retrievers={has_web_retrievers}")
-        logging.info(f"Vector selections: {vector_selections}")
-        logging.info(f"Web retriever selections: {web_retriever_selections}")
-        
-        # CRITICAL: Set RETRIEVER env var ONLY if web retrievers are explicitly selected
-        if has_web_retrievers:
-            # Build retriever list for web sources
-            retriever_list = []
-            mcp_registry = _load_mcp_registry()
-            for orig, norm in web_retriever_selections:
-                entry = mcp_registry.get(orig, {})
-                ret_name = entry.get("retriever_name", norm)
-                retriever_list.append(ret_name)
-            
-            # Use comma-separated list for multiple retrievers
-            retriever_value = ",".join(retriever_list)
-            env_prev["RETRIEVER"] = os.environ.get("RETRIEVER")
-            os.environ["RETRIEVER"] = retriever_value
-            logging.info(f"✓ Using web retrievers: {retriever_value}")
-        else:
-            # CRITICAL: Explicitly unset RETRIEVER to prevent default web search
-            env_prev["RETRIEVER"] = os.environ.get("RETRIEVER")
-            os.environ["RETRIEVER"] = 'mcp'
-            logging.info("✓ No web retrievers selected - RETRIEVER env var cleared")
-        
-        # Build MCP configs ONLY for vector stores
-        mcp_configs = None
+
         vector_store = None
-        
+        report_source = "web"
+
+        # Choose vector store (only if exactly one vector backend is selected)
         if exactly_one_vector:
             coll = cfg.get("collection")
-            if not coll:
-                raise ValueError("Collection must be specified when using MongoDB vector store")
-            
-            # Create the vector store instance
             if has_rag:
-                vector_store = get_mongo_vector_store_cached(
-                    DB_NAME_RAG, ATLAS_CONNECTION_STR_RAG, coll, True
-                )
-                logging.info(f"✓ Vector store (RAG): collection={coll}")
+                vector_store = get_mongo_vector_store_cached(DB_NAME_RAG, ATLAS_CONNECTION_STR_RAG, coll, has_rag)
             else:
-                vector_store = get_mongo_vector_store_cached(
-                    DB_NAME_REGGINIE, ATLAS_CONNECTION_STR_REGGINIE, coll, False
-                )
-                logging.info(f"✓ Vector store (RegGinie): collection={coll}")
-            
-            # Build MCP config for gpt-researcher
-            mcp_configs = []
-            if has_rag:
-                mcp_configs.append({
-                    "name": "vector_store_rag",
-                    "kind": "vector_store",
-                    "options": {
-                        "database": DB_NAME_RAG,
-                        "connection_env": "ATLAS_CONNECTION_STR",
-                        "collection": coll,
-                    },
-                })
-            if has_reg:
-                mcp_configs.append({
-                    "name": "vector_store_reg",
-                    "kind": "vector_store",
-                    "options": {
-                        "database": DB_NAME_REGGINIE,
-                        "connection_env": "ATLAS_CONNECTION_STR_REG",
-                        "collection": coll,
-                    },
-                })
-        
-        # Decide report_source based STRICTLY on what's selected
-        if exactly_one_vector and not has_web_retrievers:
-            # ONLY vector store, NO web retrievers
+                vector_store = get_mongo_vector_store_cached(DB_NAME_REGGINIE, ATLAS_CONNECTION_STR_REGGINIE, coll, has_rag)
+            logging.info("VectorStore (Mongo): %s @ %s", type(vector_store).__name__, "RAG" if has_rag else "RegGinie")
+
+        # Decide report_source
+        if exactly_one_vector and not web_mcps:
             report_source = "langchain_vectorstore"
-            logging.info("✓ Report source: langchain_vectorstore (vector store ONLY)")
-        elif has_vector and has_web_retrievers:
-            # Both vector and web retrievers
+        elif has_vector and web_mcps:
             report_source = "hybrid"
-            logging.info("✓ Report source: hybrid (vector store + web retrievers)")
-        elif has_web_retrievers:
-            # ONLY web retrievers
+        elif web_mcps:
             report_source = "web"
-            logging.info("✓ Report source: web (web retrievers ONLY)")
         else:
-            # Nothing selected - should not happen due to UI validation
-            raise ValueError("No sources selected. Please select at least one source.")
-        
-        # Handle date filters for web retrievers ONLY if they are selected
-        if has_web_retrievers:
-            date_filters = extract_date_window_from_query(query)
-            if date_filters:
-                install_date_filter_hooks(date_filters)
-                logging.info(f"✓ Date filters applied: {date_filters}")
-        
-        # Debug output for sidebar
-        st.sidebar.write(f"**Report source:** `{report_source}`")
-        if vector_selections:
-            st.sidebar.write(f"**Vector stores:** {[orig for orig, _ in vector_selections]}")
-        if web_retriever_selections:
-            st.sidebar.write(f"**Web retrievers:** {[orig for orig, _ in web_retriever_selections]}")
-        
-        # Build GPTResearcher kwargs
+            # nothing selected or both vectors selected without web → treat as web (no retrievers)
+            report_source = "web"
+
+        date_filters = extract_date_window_from_query(query)
+        st.sidebar.write(date_filters)
+        if date_filters and any(norm in _WEB_FILTER_AWARE_MCPS for norm in web_mcps_norm):
+            install_date_filter_hooks(date_filters)
+
+        st.sidebar.write(report_source, selected_mcps)
+
+        post_init_mcp_configs = None
+
         base_kwargs = dict(
             query=query,
             report_type=cfg["report_type"],
             tone=cfg["tone"],
             verbose=cfg["verbose"],
             report_source=report_source,
+            vector_store=vector_store,
         )
-        
-        # Add vector_store ONLY if we're using vector search
-        if vector_store is not None:
-            base_kwargs["vector_store"] = vector_store
-        
-        # Add MCP configs only if we have vector stores
+
         if mcp_configs:
             if _GPT_SUPPORTS_MCP_CONFIGS:
                 base_kwargs["mcp_configs"] = mcp_configs
-                logging.info(f"✓ MCP configs passed: {len(mcp_configs)} config(s)")
-        
-        # Add web-specific parameters ONLY if not pure vector store mode
+            else:
+                post_init_mcp_configs = mcp_configs
+
         if report_source != 'langchain_vectorstore':
             base_kwargs.update(
                 report_format=cfg["report_format"],
                 source_urls=urls or None,
                 complement_source_urls=cfg["complement"],
             )
-        
-        logging.info(f"✓ GPTResearcher init params: {list(base_kwargs.keys())}")
-        
-        # Initialize researcher
+
         researcher = GPTResearcher(**base_kwargs)
-        
-        # Set any additional attributes
+
+        if post_init_mcp_configs:
+            setattr(researcher, "mcp_configs", post_init_mcp_configs)
+
+        # optional extras…
         USER_EXTRAS = [
             "breadth", "depth", "max_subtopics",
             "draft_section_titles", "subtopic_name", "custom_prompt", "on_progress"
@@ -414,12 +344,12 @@ async def _async_run(query: str, cfg: Dict[str, Any]):
         for key in USER_EXTRAS:
             if key in cfg:
                 setattr(researcher, key, cfg[key])
-        
-        # ... rest of the function (UI handling, research, streaming) remains the same
+
         ui = cfg.pop("ui", {}) if isinstance(cfg.get("ui"), dict) else {}
         trace_box = ui.get("trace_box", st.empty())
         answer_container = ui.get("answer_box", st.empty())
 
+        # logging + streaming unchanged…
         fmt = logging.Formatter("INFO:     [%(asctime)s] %(message)s", datefmt="%H:%M:%S")
         handler = TraceBufferHandler(max_lines=2000)
         handler.setFormatter(fmt)
@@ -428,6 +358,7 @@ async def _async_run(query: str, cfg: Dict[str, Any]):
 
         _hook_research_logs(handler)
         pumper = asyncio.create_task(_pump_trace_ui(trace_box, handler))
+        st.write(researcher)
         try:
             def _emit_info(line: str):
                 if not line: return
@@ -481,7 +412,6 @@ async def _async_run(query: str, cfg: Dict[str, Any]):
         )
 
     finally:
-        # Restore environment variables
         for key, previous in env_prev.items():
             if previous is None:
                 os.environ.pop(key, None)
@@ -1019,33 +949,45 @@ def app():
 
 
         if run:
+            
             if not query.strip():
-                st.warning("Please enter a research question.")
-                st.stop()
+                st.warning("Please enter a research question."); st.stop()
             if report_type == "custom_report" and not extras["custom_prompt"].strip():
-                st.warning("Custom prompt is required for *custom_report*.")
-                st.stop()
+                st.warning("Custom prompt is required for *custom_report*."); st.stop()
             
             if not mcps_selected:
-                st.warning("Select at least one source from the sidebar before running.")
-                st.stop()
-            
-            # Validate MongoDB selection
-            normalized_selection = {_normalize_mcp_key(m) for m in mcps_selected}
-            use_rag = any(norm in {"vector_store_rag", "mongo_rag"} for norm in normalized_selection)
-            use_reg = any(norm in {"vector_store_reg", "mongo_reg"} for norm in normalized_selection)
-            
-            if use_rag and use_reg:
-                st.error("Please select only ONE MongoDB source (RAG or RegGinie), not both.")
-                st.stop()
-            
-            if (use_rag or use_reg) and not collection:
-                st.error("Please select a collection from the sidebar.")
-                st.stop()
-            
-            # Build config
+                st.warning("Select at least one MCP source from the sidebar before running."); st.stop()
+
+            selected_mcp_config: Dict[str, Any] = {}
+            selected_mcp_list: List[Dict[str, Any]] = []
+            for name in mcps_selected:
+                if name not in mcp_registry:
+                    continue
+                entry = deepcopy(mcp_registry[name])
+                norm = _normalize_mcp_key(name)
+                if collection:
+                    if norm in {"vector_store_rag", "mongo_rag"}:
+                        entry.setdefault("options", {})["collection"] = collection
+                    elif norm in {"vector_store_reg", "mongo_reg"}:
+                        entry.setdefault("options", {})["collection"] = collection
+
+                entry_for_json = deepcopy(entry)
+                entry_for_list = deepcopy(entry)
+                entry_for_list.setdefault("name", name)
+
+                selected_mcp_config[name] = entry_for_json
+                selected_mcp_list.append(entry_for_list)
+            try:
+                mcp_servers_json = json.dumps(selected_mcp_config)
+            except TypeError as exc:
+                st.error(f"Unable to serialize MCP configuration: {exc}"); st.stop()
+
             cfg = dict(
                 selected_mcps=mcps_selected,
+                mcp_servers_json=mcp_servers_json,
+                mcp_selection_env=",".join(mcps_selected),
+                retriever_mode="mcp",
+                mcp_configs=selected_mcp_list,
                 collection=collection,
                 report_type=report_type,
                 tone=tone,
@@ -1055,6 +997,8 @@ def app():
                 complement=complement,
                 **extras,
             )
+
+            
 
             total_q = None
             if report_type == "deep":
