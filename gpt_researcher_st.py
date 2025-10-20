@@ -958,6 +958,21 @@ def app():
             if not mcps_selected:
                 st.warning("Select at least one MCP source from the sidebar before running."); st.stop()
 
+            normalized_pairs = [(name, _normalize_mcp_key(name)) for name in mcps_selected]
+            vector_mcps = [name for name, norm in normalized_pairs if norm in _VECTOR_MCP_KEYS]
+            web_mcps = [name for name, norm in normalized_pairs if norm not in _VECTOR_MCP_KEYS]
+
+            selected_mcp_config = {
+                name: mcp_registry.get(name)
+                for name in web_mcps
+                if name in mcp_registry
+            }
+
+            if vector_mcps and not web_mcps:
+                logging.info(
+                    "Vector-only MCP selection detected; skipping MCP_SERVERS export for %s",
+                    ", ".join(vector_mcps),
+                )
             selected_mcp_config: Dict[str, Any] = {}
             selected_mcp_list: List[Dict[str, Any]] = []
             for name in mcps_selected:
@@ -978,13 +993,18 @@ def app():
                 selected_mcp_config[name] = entry_for_json
                 selected_mcp_list.append(entry_for_list)
             try:
-                mcp_servers_json = json.dumps(selected_mcp_config)
+                mcp_servers_json = json.dumps(selected_mcp_config) if selected_mcp_config else None
             except TypeError as exc:
                 st.error(f"Unable to serialize MCP configuration: {exc}"); st.stop()
+
+            mcp_selection_env = ",".join(web_mcps) if web_mcps else None
+            retriever_mode = "mcp" if web_mcps else None
 
             cfg = dict(
                 selected_mcps=mcps_selected,
                 mcp_servers_json=mcp_servers_json,
+                mcp_selection_env=mcp_selection_env,
+                retriever_mode=retriever_mode,
                 mcp_selection_env=",".join(mcps_selected),
                 retriever_mode="mcp",
                 mcp_configs=selected_mcp_list,
